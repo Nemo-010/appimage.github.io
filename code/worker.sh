@@ -26,7 +26,8 @@ cleanup() {
   kill $PIDS 2>/dev/null && sleep 2
   kill -9 $PIDS 2>/dev/null
   killall -9 icewm 2>/dev/null
-  if [ -n "$APPDIR" ] ; then fusermount -u -z "$APPDIR" 2>/dev/null ; fi
+  # fusermount3 for the DwarFS driver (fuse3), fusermount for the SquashFS runtime (fuse2)
+  if [ -n "$APPDIR" ] ; then fusermount3 -u -z "$APPDIR" 2>/dev/null || fusermount -u -z "$APPDIR" 2>/dev/null ; fi
   [ x"$TYPE" == x1 ] && sudo umount -l /mnt 2>/dev/null
   exit $RC
 }
@@ -207,32 +208,72 @@ fi
 
 set -x
 
-# If we have a type 2 AppImage, then mount it using appimagetool (not using itself for security reasons)
+# If we have a type 2 AppImage, then mount it with a separate runtime (never
+# using the AppImage's own runtime, for security reasons). Its payload can be a
+# SquashFS image (mounted by the AppImage runtime) or a DwarFS image (used,
+# e.g., by uruntime and quick-sharun; mounted by the dwarfs FUSE driver).
 if [ x"$TYPE" == x2 ] ; then
   if [ ! -e runtime-fuse2-x86_64 ] ; then # Normally provided by code/fetch-deps.sh
     wget -c -q https://github.com/AppImage/appimage.github.io/releases/download/deps/runtime-fuse2-x86_64
     chmod +x runtime*
   fi
-  # if [ -d squashfs-root ] ; then rm -rf squashfs-root/ ; fi
-  # Output to a file: in the background it must not hold on to our stdout
-  TARGET_APPIMAGE="$FILENAME" ./runtime* --appimage-mount > runtime-mount.log 2>&1 &
-  PID=$!
-  # Wait for the mount of this AppImage (not just any mount)
-  APPDIR=""
-  for WAIT in 1 2 3 4 5 6 7 8 9 10 ; do
-    sleep 1
-    APPDIR=$(mount | grep -F " type fuse.$FILENAME " | tail -n 1 | cut -d " " -f 3 || true) # No match yet is fine (set -e, pipefail)
-    [ -n "$APPDIR" ] && break
-    kill -0 $PID 2>/dev/null || break
-  done
-  if [ -z "$APPDIR" ] ; then
-    cat runtime-mount.log
-    echo "ERROR: Could not mount the AppImage. AppImageHub currently supports only AppImages with a SquashFS file system"
-    exit 1
+
+  # The payload begins right after the runtime's ELF section headers. Read the
+  # file system's magic number there to know how to mount the AppImage.
+  PAYLOAD_OFFSET=$(readelf -h "$FILENAME" | awk -F: '
+    /Start of section headers/  { gsub(/[^0-9]/, "", $2); shoff = $2 }
+    /Size of section headers/   { gsub(/[^0-9]/, "", $2); shentsize = $2 }
+    /Number of section headers/ { gsub(/[^0-9]/, "", $2); shnum = $2 }
+    END { print shoff + shentsize * shnum }
+  ')
+  PAYLOAD_MAGIC=$(dd if="$FILENAME" bs=1 skip="$PAYLOAD_OFFSET" count=6 2>/dev/null) # "DWARFS" or the SquashFS magic
+
+  if [ x"$PAYLOAD_MAGIC" == x"DWARFS" ] ; then
+    FILESYSTEM=dwarfs
+    if [ ! -e dwarfs-universal ] ; then # Normally provided by code/fetch-deps.sh
+      DWARFS_VERSION=0.15.7
+      wget -c -q "https://github.com/mhx/dwarfs/releases/download/v${DWARFS_VERSION}/dwarfs-universal-${DWARFS_VERSION}-Linux-x86_64" -O dwarfs-universal
+      # The project does not publish checksums; this is the checksum of the pinned asset
+      echo "baa03026e7d2c195fdb78bf261cd7d20f620b20685f8a3e26162ba9d652b0d78  dwarfs-universal" | sha256sum -c -
+      chmod +x dwarfs-universal
+    fi
+    mkdir -p dwarfs-mount
+    APPDIR=$(readlink -f dwarfs-mount)
+    # The dwarfs FUSE driver daemonizes after mounting, so there is no PID to
+    # wait for; output to a file so that it does not hold on to our stdout
+    if ! ./dwarfs-universal --tool=dwarfs -o offset="$PAYLOAD_OFFSET" -o readonly "$FILENAME" "$APPDIR" > dwarfs-mount.log 2>&1 ; then
+      cat dwarfs-mount.log
+      echo "ERROR: Could not mount the AppImage. AppImageHub supports AppImages with a SquashFS or DwarFS file system; other formats are not supported"
+      exit 1
+    fi
+    echo $APPDIR
+    bash appdir-lint.sh "$APPDIR"
+  else
+    FILESYSTEM=squashfs
+    # if [ -d squashfs-root ] ; then rm -rf squashfs-root/ ; fi
+    # Output to a file: in the background it must not hold on to our stdout
+    TARGET_APPIMAGE="$FILENAME" ./runtime* --appimage-mount > runtime-mount.log 2>&1 &
+    PID=$!
+    # Wait for the mount of this AppImage (not just any mount)
+    APPDIR=""
+    for WAIT in 1 2 3 4 5 6 7 8 9 10 ; do
+      sleep 1
+      APPDIR=$(mount | grep -F " type fuse.$FILENAME " | tail -n 1 | cut -d " " -f 3 || true) # No match yet is fine (set -e, pipefail)
+      [ -n "$APPDIR" ] && break
+      kill -0 $PID 2>/dev/null || break
+    done
+    if [ -z "$APPDIR" ] ; then
+      cat runtime-mount.log
+      echo "ERROR: Could not mount the AppImage. AppImageHub supports AppImages with a SquashFS or DwarFS file system; other formats are not supported"
+      exit 1
+    fi
+    echo $APPDIR
+    bash appdir-lint.sh "$APPDIR"
+    # later # kill $PID # fuse
   fi
-  echo $APPDIR
-  bash appdir-lint.sh "$APPDIR"
-  # later # kill $PID # fuse
+
+  # The trusted runtime reads the update information and the signature from the
+  # ELF sections of the AppImage, whichever file system its payload uses
   # https://github.com/AppImage/AppImageSpec/blob/master/draft.md#updateinformation
   UPDATE_INFORMATION=$(TARGET_APPIMAGE="$FILENAME" ./runtime* --appimage-updateinformation) || echo "Could not get update information from the AppImage"
   TARGET_APPIMAGE="$FILENAME" ./runtime* --appimage-signature > sig || echo "Could not get signature from the AppImage"
@@ -649,6 +690,10 @@ fi
 
 echo "X-AppImage-Architecture=$ARCHITECTURE" >> "$DATAFILE"
 
+if [ -n "$FILESYSTEM" ] ; then
+  echo "X-AppImage-Filesystem=$FILESYSTEM" >> "$DATAFILE"
+fi
+
 if [ -n "$LIBC_INFO" ] ; then
   echo "$LIBC_INFO" >> "$DATAFILE"
 fi
@@ -691,7 +736,9 @@ cp "$ICONFILE" "database/$INPUTBASENAME/icons/$ICONSIZE/"
 echo "==========================================="
 
 if [ x"$TYPE" == x2 ] ; then
-  kill $PID # fuse
+  # Unmount by path: works for the SquashFS runtime (fuse2) and for the
+  # daemonized DwarFS driver (fuse3)
+  fusermount3 -u -z "$APPDIR" 2>/dev/null || fusermount -u -z "$APPDIR" 2>/dev/null || true
 fi
 if [ x"$TYPE" == x1 ] ; then
   sudo umount -l /mnt

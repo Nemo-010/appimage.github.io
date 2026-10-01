@@ -37,7 +37,14 @@ GitHub Pages (Jekyll) from this repository.
      Qt6 over Qt5) and fails rather than guesses when several fit; a URL
      ending with `/` that is no listing is downloaded as it is),
      checks its type, mounts it with a separate runtime (never executes the
-     AppImage's own runtime), runs `appdir-lint.sh`, finds the icon;
+     AppImage's own runtime), runs `appdir-lint.sh`, finds the icon; the
+     payload's file system (SquashFS, mounted by the AppImage runtime, or
+     DwarFS, mounted read-only by the `dwarfs` FUSE driver from
+     `code/fetch-deps.sh`) is detected by the magic number right after the
+     runtime's ELF section headers and recorded as
+     `X-AppImage-Filesystem=squashfs|dwarfs`; the update information and the
+     signature are read from the AppImage's ELF sections by the trusted
+     runtime, whichever file system the payload uses;
    - `code/check-libc.sh`: does it need a compatible C library on the host?
      (`X-AppImage-Libc=none|bundled|host`, `X-AppImage-Runtime`,
      `X-AppImage-Self-Contained`, `X-AppImage-Glibc-Required=GLIBC_2.xx`, stored
